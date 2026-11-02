@@ -1,0 +1,204 @@
+name: test
+
+# Builds the action, checks that the committed dist/ matches the source, and runs the action from
+# this checkout (`uses: ./`) on every platform and configuration it claims to support.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: dist/ is up to date
+        run: |
+          if ! git diff --exit-code -- dist/; then
+            echo "::error::dist/ does not match the source; run npm run build and commit dist/"
+            exit 1
+          fi
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -no-color
+
+  default:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        version: [latest, 0.1.0]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        id: s3
+        with:
+          version: ${{ matrix.version }}
+      - name: Check outputs and environment
+        env:
+          ENDPOINT: ${{ steps.s3.outputs.endpoint }}
+          PORT: ${{ steps.s3.outputs.port }}
+          VERSION: ${{ steps.s3.outputs.version }}
+        run: |
+          test "$ENDPOINT" = http://127.0.0.1:9000
+          test "$PORT" = 9000
+          test "$FAKES3_ENDPOINT" = "$ENDPOINT"
+          test "$(fakes3 --version)" = "fakes3 $VERSION"
+          if [ "${{ matrix.version }}" != latest ]; then test "$VERSION" = "${{ matrix.version }}"; fi
+      - run: test/smoke.sh "$FAKES3_ENDPOINT" fakes3 fakes3secret
+      - name: fakes3 ctl reaches the server
+        run: |
+          fakes3 ctl status
+          fakes3 ctl reset
+          fakes3 ctl status | grep -E '^store +0 buckets'
+
+  options:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        id: strict
+        with:
+          host: 0.0.0.0
+          port: 0
+          auth: true
+          access-key: AK
+          secret-key: SK
+          users: |
+            alt:ALTKEY:ALTSECRET
+            carol:CAROLKEY:CAROLSECRET:111122223333
+          bucket-defaults: aws
+          memory-limit: 64MiB
+          args: --request-log-capacity 50
+      - name: Random port, strict auth, more accounts
+        env:
+          ENDPOINT: ${{ steps.strict.outputs.endpoint }}
+          PORT: ${{ steps.strict.outputs.port }}
+        run: |
+          test "$PORT" != 0
+          test "$ENDPOINT" = "http://127.0.0.1:$PORT"
+          test/smoke.sh "$ENDPOINT" AK SK
+          test/smoke.sh "$ENDPOINT" ALTKEY ALTSECRET
+          code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user AK:wrong -X PUT "$ENDPOINT/denied")
+          test "$code" = 403
+          fakes3 ctl status | tee status.txt
+          grep -E '^auth +strict' status.txt
+          grep -E '^new buckets +aws defaults' status.txt
+          grep -E '^user +carol .*account 111122223333' status.txt
+          grep -E '^request log .* of 50 ' status.txt
+          ss -ltn | grep -F "0.0.0.0:$PORT"
+
+      # A second server in the same job, which the AWS CLI finds through the exported variables.
+      - uses: ./
+        id: aws
+        with:
+          port: 9100
+          aws-env: true
+      - name: AWS CLI uses the exported endpoint and credentials
+        run: |
+          test "$AWS_ENDPOINT_URL_S3" = http://127.0.0.1:9100
+          test "$FAKES3_ENDPOINT" = http://127.0.0.1:9100
+          aws s3 mb s3://demo
+          echo hi > hello.txt
+          aws s3 cp hello.txt s3://demo/
+          aws s3 ls s3://demo | grep hello.txt
+          fakes3 ctl status | grep -E '^store +1 buckets, 1 objects'
+      - name: The first server is still running
+        env:
+          ENDPOINT: ${{ steps.strict.outputs.endpoint }}
+        run: test/smoke.sh "$ENDPOINT" AK SK
+
+  install-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        id: s3
+        with:
+          version: v0.1.0
+          start: false
+      - name: fakes3 is on PATH and nothing is running
+        env:
+          BINARY: ${{ steps.s3.outputs.path }}
+          ENDPOINT: ${{ steps.s3.outputs.endpoint }}
+        run: |
+          test "$(command -v fakes3)" = "$BINARY"
+          test "$(fakes3 --version)" = "fakes3 0.1.0"
+          test -z "$ENDPOINT"
+          test -z "${FAKES3_ENDPOINT:-}"
+          if curl -s http://127.0.0.1:9000/; then exit 1; fi
+      - name: Tests can start their own servers
+        run: |
+          fakes3 --port 0 > addr.txt &
+          for _ in $(seq 50); do grep -q '^http://' addr.txt && break; sleep 0.1; done
+          test/smoke.sh "$(head -n1 addr.txt)" fakes3 fakes3secret
+
+  container:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:stable-slim
+            install: apt-get update && apt-get install -y --no-install-recommends curl
+          - image: alpine:3
+            install: apk add --no-cache curl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container: ${{ matrix.image }}
+    steps:
+      - run: ${{ matrix.install }}
+      - uses: actions/checkout@v7
+      - uses: ./
+      - run: sh test/smoke.sh "$FAKES3_ENDPOINT" fakes3 fakes3secret
+
+  # The action has to fail, clearly, where fakes3 cannot run or cannot start.
+  failures:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: unsupported platform
+            runner: macos-latest
+          - case: port in use
+            runner: ubuntu-24.04
+          - case: unknown version
+            runner: ubuntu-24.04
+            version: 9.9.9
+    name: failures (${{ matrix.case }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Occupy port 9000
+        if: matrix.case == 'port in use'
+        run: |
+          python3 -m http.server 9000 --bind 127.0.0.1 > /dev/null 2>&1 &
+          sleep 1
+      - uses: ./
+        id: s3
+        continue-on-error: true
+        with:
+          version: ${{ matrix.version || 'latest' }}
+      - name: The action failed
+        env:
+          OUTCOME: ${{ steps.s3.outcome }}
+        run: test "$OUTCOME" = failure

@@ -1,0 +1,73 @@
+name: Setup fakes3
+description: Install fakes3, an in-memory S3 server for tests, and start it in the background
+author: AkaraChen
+branding:
+  icon: database
+  color: orange
+
+inputs:
+  version:
+    description: fakes3 version to install, such as `0.1.0`, or `latest`
+    default: latest
+  start:
+    description: Start the server in the background. With `false`, only put `fakes3` on PATH
+    default: "true"
+  host:
+    description: Address to listen on. Use `0.0.0.0` if tests in another container need to reach it
+    default: 127.0.0.1
+  port:
+    description: Port to listen on; `0` picks a free one (read it from the `port` output)
+    default: "9000"
+  access-key:
+    description: Access key of the default account
+    default: fakes3
+  secret-key:
+    description: Secret key of the default account
+    default: fakes3secret
+  auth:
+    description: Verify request signatures. Without it any credentials are accepted
+    default: "false"
+  users:
+    description: More accounts, one per line, as `name:access-key:secret[:account-id[:canonical-id]]`
+    default: ""
+  bucket-defaults:
+    description: Settings new buckets start with, `legacy` or `aws`. Empty uses the server's default (`legacy`)
+    default: ""
+  memory-limit:
+    description: Cap on object data, such as `512MiB`, `unlimited` or `auto`. Empty uses the server's default (`auto`)
+    default: ""
+  args:
+    description: More command-line arguments for the server, separated by whitespace
+    default: ""
+  aws-env:
+    description: >-
+      Also export AWS_ENDPOINT_URL_S3, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_REGION and
+      AWS_DEFAULT_REGION if unset) so AWS SDKs and the AWS CLI use fakes3. This replaces any real AWS
+      credentials for later steps
+    default: "false"
+  wait-timeout:
+    description: Seconds to wait for the server to start listening
+    default: "10"
+
+outputs:
+  version:
+    description: The fakes3 version that was installed
+  path:
+    description: Path of the fakes3 binary
+  endpoint:
+    description: URL to point S3 clients at, such as `http://127.0.0.1:9000`
+  port:
+    description: Port the server listens on
+  access-key:
+    description: Access key of the default account
+  secret-key:
+    description: Secret key of the default account
+  pid:
+    description: Process id of the server
+  log-file:
+    description: File the server's output goes to
+
+runs:
+  using: node24
+  main: dist/main.js
+  post: dist/post.js
